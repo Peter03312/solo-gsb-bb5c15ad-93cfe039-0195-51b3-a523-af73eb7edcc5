@@ -265,28 +265,33 @@ def correct_calibration(conn, payload) -> tuple[dict[str, Any], list[dict[str, A
 
 # ---- 报告发布 ------------------------------------------------------------------
 
-def publish_report(conn, payload) -> dict[str, Any]:
+def _decide_and_insert(conn, instrument: str, tested_at: datetime,
+                       reference: str | None) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """按“禁用优先 + 当前通过校准覆盖”判定并落库，返回 (报告行, 所据校准行, 快照)。
+
+    首次提交与复测接替共用同一套放行规则；阻断（禁用/无校准/区间外/未通过）
+    抛 422，编号冲突抛 409，调用方事务整体回滚，不留任何痕迹。
+    """
     # 禁用优先：命中未撤销禁用区间即拒绝放行，即使当前校准通过。
-    active_disable = find_active_disable(conn, payload.instrument,
-                                         payload.tested_at, lock=True)
+    active_disable = find_active_disable(conn, instrument, tested_at, lock=True)
     if active_disable is not None:
         raise blocked(
             REASON_DISABLED,
-            f"检测时间 {payload.tested_at.isoformat()} 命中仪器 "
-            f"{payload.instrument} 的未撤销禁用区间（事件 {active_disable['event_no']}）："
+            f"检测时间 {tested_at.isoformat()} 命中仪器 "
+            f"{instrument} 的未撤销禁用区间（事件 {active_disable['event_no']}）："
             f"{active_disable['reason']}",
-            instrument=payload.instrument,
-            tested_at=payload.tested_at.isoformat(),
+            instrument=instrument,
+            tested_at=tested_at.isoformat(),
             disable=disable_brief(active_disable),
         )
 
-    decision = determine(conn, payload.instrument, payload.tested_at, lock=True)
+    decision = determine(conn, instrument, tested_at, lock=True)
     basis = decision["calibration"]
     snapshot: dict[str, Any] = {
         "released": decision["releasable"],
         "reason_code": decision["reason_code"],
-        "instrument": payload.instrument,
-        "tested_at": payload.tested_at.isoformat(),
+        "instrument": instrument,
+        "tested_at": tested_at.isoformat(),
     }
     if basis is not None:
         snapshot["basis_calibration"] = _cal_brief(basis)
@@ -295,8 +300,8 @@ def publish_report(conn, payload) -> dict[str, Any]:
         raise blocked(
             decision["reason_code"],
             decision["reason_message"],
-            instrument=payload.instrument,
-            tested_at=payload.tested_at.isoformat(),
+            instrument=instrument,
+            tested_at=tested_at.isoformat(),
             nearest_calibration=(
                 _cal_brief(decision["nearest_calibration"])
                 if decision.get("nearest_calibration") else None
@@ -313,14 +318,19 @@ def publish_report(conn, payload) -> dict[str, Any]:
                 VALUES (%s, %s, %s, TRUE, %s, %s)
                 RETURNING *
                 """,
-                (payload.reference, payload.instrument, payload.tested_at,
+                (reference, instrument, tested_at,
                  basis["id"], json.dumps(snapshot)),
             )
         except UniqueViolation:
             raise conflict("REPORT_REFERENCE_EXISTS",
-                           f"报告编号已存在: {payload.reference}")
+                           f"报告编号已存在: {reference}")
         report = cur.fetchone()
+    return report, basis, snapshot
 
+
+def publish_report(conn, payload) -> dict[str, Any]:
+    report, basis, snapshot = _decide_and_insert(
+        conn, payload.instrument, payload.tested_at, payload.reference)
     return {
         "released": True,
         "reason_code": REASON_PASSED,
@@ -329,6 +339,141 @@ def publish_report(conn, payload) -> dict[str, Any]:
         "reference": report["reference"],
         "snapshot": snapshot,
     }
+
+
+# ---- 报告接替（复测） ------------------------------------------------------------
+
+def supersede_report(conn, report_id: int, payload) -> dict[str, Any]:
+    """复测并接替已发布报告：原子发布新报告 + 记录接替关系。
+
+    - 旧报告不存在 -> 404；已被接替 -> 409 REPORT_ALREADY_SUPERSEDED（链不分叉）
+    - 放行规则与首次提交完全一致（禁用优先 + 当前通过校准覆盖）；
+      被阻断或新编号冲突时整体回滚：旧报告仍有效，不留下接替记录
+    - 新报告编号沿用全局唯一约束，旧编号不得转移或复用（唯一索引保证）
+    """
+    with conn.cursor() as cur:
+        # 行锁使“同一旧报告”的接替串行；唯一索引 uq_supersession_old_report 兜底
+        cur.execute("SELECT * FROM reports WHERE id = %s FOR UPDATE", (report_id,))
+        old = cur.fetchone()
+        if old is None:
+            raise not_found("报告", report_id)
+        cur.execute(
+            "SELECT * FROM report_supersessions WHERE old_report_id = %s",
+            (report_id,),
+        )
+        existing = cur.fetchone()
+    if existing is not None:
+        raise conflict(
+            "REPORT_ALREADY_SUPERSEDED",
+            f"报告 {report_id} 已被报告 {existing['new_report_id']} 接替，"
+            "只有尚未被接替的当前有效报告才能被接替",
+            old_report_id=report_id,
+            superseded_by=existing["new_report_id"],
+        )
+
+    report, basis, snapshot = _decide_and_insert(
+        conn, payload.instrument, payload.tested_at, payload.reference)
+
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                """
+                INSERT INTO report_supersessions (old_report_id, new_report_id, reason)
+                VALUES (%s, %s, %s)
+                RETURNING *
+                """,
+                (report_id, report["id"], payload.reason),
+            )
+        except UniqueViolation:
+            # 并发接替同一旧报告：唯一索引保证至多一个成功；本事务整体回滚，
+            # 新报告与接替记录都不留，旧报告仍有效
+            raise conflict(
+                "REPORT_ALREADY_SUPERSEDED",
+                f"报告 {report_id} 已被并发接替，本次接替未生效",
+                old_report_id=report_id,
+            )
+        supersession = cur.fetchone()
+
+    return {
+        "released": True,
+        "reason_code": REASON_PASSED,
+        "basis_calibration": _cal_brief(basis),
+        "report_id": report["id"],
+        "reference": report["reference"],
+        "snapshot": snapshot,
+        "superseded_report_id": report_id,
+        "current_report_id": report["id"],
+        "supersession": {
+            "old_report_id": supersession["old_report_id"],
+            "new_report_id": supersession["new_report_id"],
+            "reason": supersession["reason"],
+            "created_at": supersession["created_at"].isoformat(),
+        },
+    }
+
+
+# 从链内任一报告出发，沿接替边双向遍历取全链成员。
+# 接替边恒由新报告指向旧报告（id 单调），链为无环单路径，递归必然终止。
+_CHAIN_MEMBERS_CTE = """
+    WITH RECURSIVE members(id) AS (
+        SELECT %s::bigint
+        UNION
+        SELECT CASE WHEN s.old_report_id = m.id THEN s.new_report_id
+                    ELSE s.old_report_id END
+        FROM report_supersessions s, members m
+        WHERE m.id = s.old_report_id OR m.id = s.new_report_id
+    )
+"""
+
+
+def chain_tip_id(conn, report_id: int) -> int:
+    """该报告所在接替链的当前有效报告（未被接替的链尾）。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            _CHAIN_MEMBERS_CTE + """
+            SELECT m.id
+            FROM members m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM report_supersessions s
+                WHERE s.old_report_id = m.id
+            )
+            """,
+            (report_id,),
+        )
+        row = cur.fetchone()
+    # 唯一索引保证链不分叉，链尾至多一个；报告存在时恰有一个
+    return row["id"] if row else report_id
+
+
+def report_lineage(conn, report_id: int) -> dict[str, Any] | None:
+    """完整沿革：链内全部报告（含各自不可变快照）、每次接替记录、当前有效报告。
+
+    报告不存在返回 None。只读，不改写任何报告与快照。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM reports WHERE id = %s", (report_id,))
+        if cur.fetchone() is None:
+            return None
+        cur.execute(
+            _CHAIN_MEMBERS_CTE + """
+            SELECT r.* FROM reports r JOIN members m ON m.id = r.id ORDER BY r.id
+            """,
+            (report_id,),
+        )
+        reports = cur.fetchall()
+        cur.execute(
+            _CHAIN_MEMBERS_CTE + """
+            SELECT s.* FROM report_supersessions s
+            JOIN members m ON m.id = s.old_report_id
+            ORDER BY s.id
+            """,
+            (report_id,),
+        )
+        supersessions = cur.fetchall()
+    superseded = {s["old_report_id"] for s in supersessions}
+    current = next(r["id"] for r in reports if r["id"] not in superseded)
+    return {"reports": reports, "supersessions": supersessions,
+            "current_report_id": current}
 
 
 # ---- 漂移重算 ------------------------------------------------------------------

@@ -79,6 +79,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_report_reference
 CREATE INDEX IF NOT EXISTS ix_report_instrument_tested
     ON reports (instrument, tested_at);
 
+-- 报告接替链：复测新报告接替已发布旧报告。旧报告与其发布快照永久保留，
+-- “当前有效报告”= 链上未被接替的链尾（按接替关系实时计算，不落库）。
+CREATE TABLE IF NOT EXISTS report_supersessions (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    old_report_id BIGINT      NOT NULL REFERENCES reports(id),
+    new_report_id BIGINT      NOT NULL REFERENCES reports(id),
+    reason        TEXT        NOT NULL,             -- 接替原因（非空，应用层校验）
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 同一旧报告至多被接替一次 —— 并发接替至多成功一次，链不分叉
+CREATE UNIQUE INDEX IF NOT EXISTS uq_supersession_old_report
+    ON report_supersessions (old_report_id);
+-- 同一新报告至多接替一条旧报告 —— 链不合并；且新报告恒为当事务内新建
+-- （id 单调递增），接替边只能由新指向旧，链天然无环
+CREATE UNIQUE INDEX IF NOT EXISTS uq_supersession_new_report
+    ON report_supersessions (new_report_id);
+
 -- 仪器禁用区间（校准合格后仪器仍可能因故障被禁用）。
 -- 撤销仅置 revoked = TRUE，记录保留供追溯。
 CREATE TABLE IF NOT EXISTS instrument_disable_events (
