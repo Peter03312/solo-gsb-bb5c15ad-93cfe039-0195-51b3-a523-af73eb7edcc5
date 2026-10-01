@@ -43,6 +43,26 @@ class ReportSubmit(BaseModel):
     _normalize_tested = field_validator("tested_at")(lambda cls, v: as_utc(v))
 
 
+class ReportSupersede(BaseModel):
+    """复测接替：以一份新复测报告接替指定的当前有效报告。"""
+
+    instrument: str = Field(..., min_length=1, description="复测仪器标识")
+    tested_at: datetime = Field(..., description="复测检测时间，据此判定放行")
+    reference: str | None = Field(
+        None, description="可选新报告编号；提供则需全局唯一（旧编号不得转移或复用）"
+    )
+    reason: str = Field(..., min_length=1, description="非空接替原因（随接替记录永久留痕）")
+
+    _normalize_tested = field_validator("tested_at")(lambda cls, v: as_utc(v))
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("接替原因不能为空")
+        return value
+
+
 class DisableCreate(BaseModel):
     event_no: str = Field(..., min_length=1, description="唯一禁用事件号（业务侧生成，撤销后也不可复用）")
     instrument: str = Field(..., min_length=1, description="仪器标识")
@@ -84,6 +104,18 @@ class ReleaseWindowQuery(BaseModel):
         if self.end <= self.start:
             raise ValueError("查询范围必须满足 start < end（左闭右开，非空时段）")
         return self
+
+
+def serialize_supersession(row: dict[str, Any]) -> dict[str, Any]:
+    """接替记录（出现在接替响应与沿革查询中）。"""
+    return {
+        "id": row["id"],
+        "chain_id": row["chain_id"],
+        "old_report_id": row["old_report_id"],
+        "new_report_id": row["new_report_id"],
+        "reason": row["reason"],
+        "created_at": row["created_at"].isoformat(),
+    }
 
 
 def serialize_disable(row: dict[str, Any]) -> dict[str, Any]:

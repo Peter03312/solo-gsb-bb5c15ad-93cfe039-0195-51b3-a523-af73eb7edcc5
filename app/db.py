@@ -62,14 +62,25 @@ CREATE INDEX IF NOT EXISTS ix_calibration_instrument_current
     ON calibration_versions (instrument) WHERE is_current;
 CREATE INDEX IF NOT EXISTS ix_calibration_chain ON calibration_versions (chain_id);
 
--- 已发布报告（阻断的报告不落库），快照发布当时的判定依据
+-- 报告链：一份原始报告及其历次复测接替版构成一条链（链上始终只有一份现行有效报告）
+CREATE TABLE IF NOT EXISTS report_chains (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 已发布报告（阻断的报告不落库），快照发布当时的判定依据。
+-- superseded_by_id 为 NULL 表示该报告是链上现行有效版本；
+-- 被复测接替后指针指向新版，旧版行与快照永久保留可查。
 CREATE TABLE IF NOT EXISTS reports (
     id                   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    chain_id             BIGINT NOT NULL CONSTRAINT fk_reports_chain
+                         REFERENCES report_chains(id),
     reference            TEXT,                          -- 业务侧报告编号（可选，唯一）
     instrument           TEXT        NOT NULL,
     tested_at            TIMESTAMPTZ NOT NULL,
     released             BOOLEAN     NOT NULL,
     basis_calibration_id BIGINT REFERENCES calibration_versions(id),
+    superseded_by_id     BIGINT REFERENCES reports(id), -- NULL = 链上现行有效报告
     snapshot             JSONB       NOT NULL,          -- 发布时判定快照（不可变）
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -78,6 +89,55 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_report_reference
     ON reports (reference) WHERE reference IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_report_instrument_tested
     ON reports (instrument, tested_at);
+
+-- 存量升级：为既有 reports 补链与接替指针（新装已由上方 CREATE TABLE 建好）
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS chain_id BIGINT;
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS superseded_by_id BIGINT
+    REFERENCES reports(id);
+
+-- 存量报告各自成链（链 id 取报告 id），链行同步补建后回填并收紧约束
+INSERT INTO report_chains (id, created_at) OVERRIDING SYSTEM VALUE
+    SELECT id, created_at FROM reports WHERE chain_id IS NULL;
+SELECT setval(pg_get_serial_sequence('report_chains', 'id'),
+              GREATEST(COALESCE((SELECT max(id) FROM report_chains), 0), 1));
+UPDATE reports SET chain_id = id WHERE chain_id IS NULL;
+ALTER TABLE reports ALTER COLUMN chain_id SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_reports_chain'
+    ) THEN
+        ALTER TABLE reports ADD CONSTRAINT fk_reports_chain
+            FOREIGN KEY (chain_id) REFERENCES report_chains(id);
+    END IF;
+END $$;
+
+-- 一份新版报告至多接替一份旧版（指针唯一，配合接替表唯一索引防链合并/成环）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_report_superseded_by
+    ON reports (superseded_by_id) WHERE superseded_by_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_report_chain ON reports (chain_id);
+
+-- 报告接替关系：每次复测接替一行（含非空原因），永久保留供追溯；
+-- 仅成功事务落库——被阻断或编号冲突时整体回滚，不留接替记录。
+CREATE TABLE IF NOT EXISTS report_supersessions (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    chain_id      BIGINT NOT NULL REFERENCES report_chains(id),
+    old_report_id BIGINT NOT NULL REFERENCES reports(id),
+    new_report_id BIGINT NOT NULL REFERENCES reports(id),
+    reason        TEXT   NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_supersession_distinct CHECK (old_report_id <> new_report_id)
+);
+
+-- 同一旧版报告至多被接替一次（链不分叉；并发接替至多成功一次）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_supersession_old
+    ON report_supersessions (old_report_id);
+-- 同一新版报告至多接替一份旧版（链不合并、不成环）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_supersession_new
+    ON report_supersessions (new_report_id);
+CREATE INDEX IF NOT EXISTS ix_supersession_chain
+    ON report_supersessions (chain_id);
 
 -- 仪器禁用区间（校准合格后仪器仍可能因故障被禁用）。
 -- 撤销仅置 revoked = TRUE，记录保留供追溯。

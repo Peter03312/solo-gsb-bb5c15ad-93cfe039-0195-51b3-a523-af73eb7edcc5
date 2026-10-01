@@ -1,7 +1,7 @@
 # 实验室检测报告放行服务
 
 基于 **Python + FastAPI + PostgreSQL** 的 HTTP API：管理仪器校准记录（含有效期、通过/未通过结论、更正版本链）、
-仪器禁用区间（故障停用与撤销追溯），并据此对检测报告做放行判定。
+仪器禁用区间（故障停用与撤销追溯），据此对检测报告做放行判定，并支持已发布报告的**复测接替**（沿革可追溯）。
 
 ## 核心规则
 
@@ -22,9 +22,15 @@
 - 已发布报告的快照**永不改写**；更正校准后可按当前有效性重算，列出结论与快照不同的报告。
 - 可按**当前禁用状态**查询受影响的已发布报告及对应禁用依据；追溯登记或撤销禁用后结果随之变化，
   但原放行记录与快照不改写。
-- 禁用变更、校准更正与报告发布事务均运行在 **SERIALIZABLE** 隔离级别并对冲突自动重试，
-  配合唯一部分索引、GiST 排他约束与行锁，杜绝“双最新版”、“禁用区间重叠”和
-  “在已生效禁用区间内误放行”。
+- **已发布报告可因复测被新报告接替**：输入当前有效报告 ID、复测仪器、检测时间、可选新编号与
+  **非空接替原因**；复测沿用“禁用优先 + 当前通过校准覆盖”的同一套放行规则。成功时新报告与
+  接替关系**原子**发布，旧版报告及各自快照**永久保留**，链上现行有效报告切换为新版；
+  被阻断或编号冲突时整体回滚——旧报告仍有效，不留下接替记录。只有**尚未被接替**的已发布
+  报告可被接替；新编号沿用全局唯一约束，**旧编号不得转移或复用**。报告链线性（不分叉、不成环），
+  按链内任一报告 ID 可查询完整沿革、每次接替原因及当前有效报告。
+- 禁用变更、校准更正、报告发布与接替事务均运行在 **SERIALIZABLE** 隔离级别并对冲突自动重试，
+  配合唯一部分索引、GiST 排他约束与行锁，杜绝“双最新版”、“禁用区间重叠”、
+  “在已生效禁用区间内误放行”和“同一旧版被重复接替”。
 
 ## 一键启动
 
@@ -91,10 +97,12 @@ uvicorn app.main:app --reload
 | --- | --- | --- |
 | POST | `/reports` | 提交报告并判定放行（禁用判定优先于校准判定） |
 | GET | `/reports?instrument=` | 已发布报告列表（含不可变快照） |
-| GET | `/reports/{id}` | 单条报告 |
+| GET | `/reports/{id}` | 单条报告（含被接替的旧版，永久可查） |
 | GET | `/reports/drift/recompute` | 同上，重算漂移 |
+| POST | `/reports/{id}/supersede` | 复测接替：以新复测报告原子接替当前有效报告 |
+| GET | `/reports/{id}/history` | 按链内任一报告 ID 查询完整沿革、每次接替原因与当前有效报告 |
 
-### 仪器禁用（本轮新增）
+### 仪器禁用（既有能力）
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -104,11 +112,18 @@ uvicorn app.main:app --reload
 | GET | `/disables/{event_no}` | 按事件号查看单条禁用事件（含已撤销） |
 | GET | `/disables/affected-reports?instrument=` | 当前受禁用影响的已发布报告及禁用依据 |
 
-### 排班规划（本轮新增）
+### 排班规划（既有能力）
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/planning/release-windows` | 查询一组仪器在指定时间范围内何时**全组**具备报告放行条件 |
+
+### 报告复测接替（本轮新增）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/reports/{id}/supersede` | 以复测报告接替 `{id}` 指定的当前有效报告（原子发布新报告 + 接替关系） |
+| GET | `/reports/{id}/history` | 按链内任一报告 ID 查完整沿革：全部版本、每次接替原因、当前有效报告 |
 
 ## 调用示例
 
@@ -424,11 +439,96 @@ curl -sS -X POST http://localhost:8000/planning/release-windows \
 入参校验（`422`）：`instruments` 为空 / 含空标识 / 有重复，或 `end <= start`
 （无时区时间戳按既有约定视为 UTC，不同时区会先归一化到 UTC 再比较）。
 
+### 10. 复测接替：以新报告原子接替当前有效报告
+
+已发布报告因复测需要换代时，对**当前有效报告**发起接替；请求体含复测仪器、
+检测时间、可选新报告编号与**非空接替原因**：
+
+```bash
+curl -sS -X POST http://localhost:8000/reports/1/supersede \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "instrument": "HPLC-01",
+        "tested_at": "2026-03-20T09:00:00Z",
+        "reference": "R-2026-0001-RETEST",
+        "reason": "初测色谱峰异常，复测确认"
+      }'
+```
+
+- 放行规则与 `POST /reports` **完全一致**（禁用优先 + 当前通过校准覆盖）；
+  被阻断返回同样的 `422` 原因码（`INSTRUMENT_DISABLED` / `NO_CALIBRATION` /
+  `OUTSIDE_VALID_PERIOD` / `CALIBRATION_NOT_PASSED`）。
+- 成功（`201`）时新报告与接替关系**同一事务原子落库**：旧版报告及其快照
+  永久保留、可继续按 ID 查询，链上现行有效报告切换为新版。响应在原发布
+  响应基础上附带 `superseded_report_id` 与 `supersession`（接替留痕）：
+
+```json
+{
+  "released": true,
+  "reason_code": "PASSED_CALIBRATION_COVERAGE",
+  "basis_calibration": {"id": 1, "chain_id": 1, "version": 1, "passed": true, "...": "..."},
+  "report_id": 2,
+  "reference": "R-2026-0001-RETEST",
+  "chain_id": 2,
+  "snapshot": {"released": true, "reason_code": "PASSED_CALIBRATION_COVERAGE", "...": "..."},
+  "superseded_report_id": 1,
+  "supersession": {
+    "id": 1, "chain_id": 2,
+    "old_report_id": 1, "new_report_id": 2,
+    "reason": "初测色谱峰异常，复测确认",
+    "created_at": "2026-10-01T00:00:00+00:00"
+  }
+}
+```
+
+- 失败约定（**旧报告仍有效，不留下接替记录**，新报告不落库）：
+  - 旧报告不存在：`404 NOT_FOUND`；
+  - 旧报告已被接替（含并发败方）：`409 REPORT_ALREADY_SUPERSEDED`，
+    `detail.current_report_id` 给出该链**现行有效报告标识**；
+  - 新编号与任一既有报告（含旧版自身）重复：`409 REPORT_REFERENCE_EXISTS`
+    —— 编号全局唯一，旧编号不得转移或复用；
+  - 接替原因为空或纯空白：`422`（请求校验）。
+- 只有**尚未被接替**的已发布报告可被接替；同一旧版的并发接替**至多成功一次**。
+
+### 11. 查询报告链完整沿革
+
+按链内**任一**报告 ID（旧版或新版均可）查询完整沿革：
+
+```bash
+curl -sS http://localhost:8000/reports/1/history
+```
+
+返回该链全部报告版本（含各自不可变快照与 `is_current` 标记）、每次接替的
+原因与时间、以及当前有效报告标识；链为线性结构（不分叉、不成环）：
+
+```json
+{
+  "chain_id": 2,
+  "current_report_id": 2,
+  "report_count": 2,
+  "reports": [
+    {"id": 1, "reference": "R-2026-0001", "is_current": false,
+     "superseded_by_id": 2, "snapshot": {"...": "..."}, "...": "..."},
+    {"id": 2, "reference": "R-2026-0001-RETEST", "is_current": true,
+     "superseded_by_id": null, "snapshot": {"...": "..."}, "...": "..."}
+  ],
+  "supersessions": [
+    {"id": 1, "chain_id": 2, "old_report_id": 1, "new_report_id": 2,
+     "reason": "初测色谱峰异常，复测确认", "created_at": "2026-10-01T00:00:00+00:00"}
+  ]
+}
+```
+
+兼容性：单报告提交（`POST /reports`）与查询（`GET /reports` / `GET /reports/{id}`）
+的请求与响应保持原有字段不变，仅**附加** `chain_id`、`superseded_by_id`、
+`is_current` 等追溯字段；未经历过接替的报告各自成链、`is_current=true`。
+
 ### 脚本化完整演示
 
 ```bash
 bash examples/curl-demo.sh                     # curl 版全流程（含禁用登记/撤销）
 bash examples/planning-demo.sh                 # 排班规划：仪器组可放行时间窗
+bash examples/supersede-demo.sh                # 复测接替：发布->接替->沿革->冲突约定
 BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正与禁用流程的 Python 版
 ```
 
@@ -457,3 +557,13 @@ BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正与�
    按当前未撤销禁用区间与当前校准版本实时计算，单次查询共用同一已提交快照，
    不物化、不改写报告与快照；登记/撤销/更正的结果对之后的查询立即可见，
    但一次查询不会混用变更前后状态。
+7. **同一旧版报告不会被重复接替，链不分叉、不成环**
+   - 接替事务先 `SELECT … FOR UPDATE` 锁定旧报告行，同旧版的并发接替在此串行；
+     后到者（串行化失败重试后）看到 `superseded_by_id` 已置位，返回
+     `409 REPORT_ALREADY_SUPERSEDED` 并附该链现行有效报告标识；
+   - 唯一索引 `uq_supersession_old`（同一旧版至多一条接替记录）与
+     `uq_supersession_new`（同一新版至多接替一份旧版）在数据库层兜底，
+     配合“新版总是全新插入、链标识继承自旧版”，链结构恒为线性单链；
+   - 新报告、旧版指针更新与接替记录在同一 SERIALIZABLE 事务提交：判定被阻断
+     或编号冲突时整体回滚，旧报告仍有效，不留接替记录；
+   - 沿革查询为 SERIALIZABLE 只读事务，单次查询看到同一已提交状态的完整链。

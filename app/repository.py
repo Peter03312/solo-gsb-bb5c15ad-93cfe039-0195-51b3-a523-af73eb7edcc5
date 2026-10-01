@@ -265,28 +265,34 @@ def correct_calibration(conn, payload) -> tuple[dict[str, Any], list[dict[str, A
 
 # ---- 报告发布 ------------------------------------------------------------------
 
-def publish_report(conn, payload) -> dict[str, Any]:
+def _decide_and_insert(conn, *, chain_id: int, instrument: str,
+                       tested_at: datetime, reference: str | None):
+    """按当前状态判定放行并落库一份报告，返回 (报告行, 所据校准, 快照)。
+
+    判定规则（单报告提交与复测接替共用）：禁用区间优先——命中未撤销禁用
+    即 422；再按“当前通过校准覆盖”判定。阻断或编号冲突抛 4xx，整个事务
+    回滚，不落库、不留任何痕迹。
+    """
     # 禁用优先：命中未撤销禁用区间即拒绝放行，即使当前校准通过。
-    active_disable = find_active_disable(conn, payload.instrument,
-                                         payload.tested_at, lock=True)
+    active_disable = find_active_disable(conn, instrument, tested_at, lock=True)
     if active_disable is not None:
         raise blocked(
             REASON_DISABLED,
-            f"检测时间 {payload.tested_at.isoformat()} 命中仪器 "
-            f"{payload.instrument} 的未撤销禁用区间（事件 {active_disable['event_no']}）："
+            f"检测时间 {tested_at.isoformat()} 命中仪器 "
+            f"{instrument} 的未撤销禁用区间（事件 {active_disable['event_no']}）："
             f"{active_disable['reason']}",
-            instrument=payload.instrument,
-            tested_at=payload.tested_at.isoformat(),
+            instrument=instrument,
+            tested_at=tested_at.isoformat(),
             disable=disable_brief(active_disable),
         )
 
-    decision = determine(conn, payload.instrument, payload.tested_at, lock=True)
+    decision = determine(conn, instrument, tested_at, lock=True)
     basis = decision["calibration"]
     snapshot: dict[str, Any] = {
         "released": decision["releasable"],
         "reason_code": decision["reason_code"],
-        "instrument": payload.instrument,
-        "tested_at": payload.tested_at.isoformat(),
+        "instrument": instrument,
+        "tested_at": tested_at.isoformat(),
     }
     if basis is not None:
         snapshot["basis_calibration"] = _cal_brief(basis)
@@ -295,8 +301,8 @@ def publish_report(conn, payload) -> dict[str, Any]:
         raise blocked(
             decision["reason_code"],
             decision["reason_message"],
-            instrument=payload.instrument,
-            tested_at=payload.tested_at.isoformat(),
+            instrument=instrument,
+            tested_at=tested_at.isoformat(),
             nearest_calibration=(
                 _cal_brief(decision["nearest_calibration"])
                 if decision.get("nearest_calibration") else None
@@ -308,26 +314,160 @@ def publish_report(conn, payload) -> dict[str, Any]:
             cur.execute(
                 """
                 INSERT INTO reports
-                    (reference, instrument, tested_at, released,
+                    (chain_id, reference, instrument, tested_at, released,
                      basis_calibration_id, snapshot)
-                VALUES (%s, %s, %s, TRUE, %s, %s)
+                VALUES (%s, %s, %s, %s, TRUE, %s, %s)
                 RETURNING *
                 """,
-                (payload.reference, payload.instrument, payload.tested_at,
+                (chain_id, reference, instrument, tested_at,
                  basis["id"], json.dumps(snapshot)),
             )
         except UniqueViolation:
             raise conflict("REPORT_REFERENCE_EXISTS",
-                           f"报告编号已存在: {payload.reference}")
+                           f"报告编号已存在: {reference}")
         report = cur.fetchone()
+    return report, basis, snapshot
 
+
+def publish_report(conn, payload) -> dict[str, Any]:
+    # 每份原始报告自开一条链；若放行被阻断，链行同事务回滚，不留空链
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO report_chains DEFAULT VALUES RETURNING id")
+        chain_id = cur.fetchone()["id"]
+    report, basis, snapshot = _decide_and_insert(
+        conn, chain_id=chain_id, instrument=payload.instrument,
+        tested_at=payload.tested_at, reference=payload.reference)
     return {
         "released": True,
         "reason_code": REASON_PASSED,
         "basis_calibration": _cal_brief(basis),
         "report_id": report["id"],
         "reference": report["reference"],
+        "chain_id": report["chain_id"],
         "snapshot": snapshot,
+    }
+
+
+# ---- 报告接替（复测） -----------------------------------------------------------
+
+def _chain_current(conn, chain_id: int) -> dict[str, Any] | None:
+    """链上现行有效报告（superseded_by_id 为 NULL 的那一份）。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM reports WHERE chain_id = %s AND superseded_by_id IS NULL",
+            (chain_id,),
+        )
+        return cur.fetchone()
+
+
+def supersede_report(conn, report_id: int, payload) -> dict[str, Any]:
+    """以复测报告接替一份当前有效报告；新报告与接替关系同一事务原子落库。
+
+    - 旧报告不存在 -> 404
+    - 旧报告已被接替 -> 409 REPORT_ALREADY_SUPERSEDED（附现行报告标识）
+    - 复测放行被阻断 / 新编号冲突 -> 抛错回滚：旧报告仍有效，不留接替记录
+    """
+    with conn.cursor() as cur:
+        # 锁旧报告行：同一旧版的并发接替在此串行，后到者重试后看到已被接替
+        cur.execute("SELECT * FROM reports WHERE id = %s FOR UPDATE", (report_id,))
+        old = cur.fetchone()
+    if old is None:
+        raise not_found("报告", report_id)
+    if not old["released"]:
+        # 防御：被阻断的报告本不落库，正常不会走到
+        raise conflict("REPORT_NOT_RELEASED",
+                       f"报告 {report_id} 不是已发布报告，不能被接替",
+                       report_id=report_id)
+    if old["superseded_by_id"] is not None:
+        current = _chain_current(conn, old["chain_id"])
+        current_id = current["id"] if current else old["superseded_by_id"]
+        raise conflict(
+            "REPORT_ALREADY_SUPERSEDED",
+            f"报告 {report_id} 已被报告 {old['superseded_by_id']} 接替，"
+            f"该链现行有效报告为 {current_id}；同一旧版至多接替一次",
+            report_id=report_id,
+            superseded_by_id=old["superseded_by_id"],
+            current_report_id=current_id,
+            chain_id=old["chain_id"],
+        )
+
+    # 复测放行判定与单报告提交同一套规则（禁用优先 + 当前通过校准覆盖）；
+    # 新编号沿用全局唯一约束，旧编号不得转移或复用（唯一索引拦截）。
+    new_report, basis, snapshot = _decide_and_insert(
+        conn, chain_id=old["chain_id"], instrument=payload.instrument,
+        tested_at=payload.tested_at, reference=payload.reference)
+
+    with conn.cursor() as cur:
+        # 旧版下线（指针指向新版）+ 接替关系留痕，与新报告同一事务提交
+        cur.execute(
+            "UPDATE reports SET superseded_by_id = %s WHERE id = %s",
+            (new_report["id"], old["id"]),
+        )
+        try:
+            cur.execute(
+                """
+                INSERT INTO report_supersessions
+                    (chain_id, old_report_id, new_report_id, reason)
+                VALUES (%s, %s, %s, %s)
+                RETURNING *
+                """,
+                (old["chain_id"], old["id"], new_report["id"], payload.reason),
+            )
+        except UniqueViolation:
+            # 行锁已保证不会走到；唯一索引兜底（并发接替同一旧版）
+            raise conflict(
+                "REPORT_ALREADY_SUPERSEDED",
+                f"报告 {report_id} 已被其他复测接替，同一旧版至多接替一次",
+                report_id=report_id,
+                chain_id=old["chain_id"],
+            )
+        supersession = cur.fetchone()
+
+    return {
+        "released": True,
+        "reason_code": REASON_PASSED,
+        "basis_calibration": _cal_brief(basis),
+        "report_id": new_report["id"],
+        "reference": new_report["reference"],
+        "chain_id": old["chain_id"],
+        "snapshot": snapshot,
+        "superseded_report_id": old["id"],
+        "supersession": {
+            "id": supersession["id"],
+            "chain_id": supersession["chain_id"],
+            "old_report_id": supersession["old_report_id"],
+            "new_report_id": supersession["new_report_id"],
+            "reason": supersession["reason"],
+            "created_at": supersession["created_at"].isoformat(),
+        },
+    }
+
+
+def report_history(conn, report_id: int) -> dict[str, Any] | None:
+    """按链内任一报告 ID 返回完整沿革；报告不存在返回 None。
+
+    链上全部版本（含各自不可变快照）+ 每次接替原因 + 当前有效报告。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM reports WHERE id = %s", (report_id,))
+        probe = cur.fetchone()
+        if probe is None:
+            return None
+        chain_id = probe["chain_id"]
+        cur.execute(
+            "SELECT * FROM reports WHERE chain_id = %s ORDER BY id", (chain_id,))
+        reports = cur.fetchall()
+        cur.execute(
+            "SELECT * FROM report_supersessions WHERE chain_id = %s ORDER BY id",
+            (chain_id,))
+        supersessions = cur.fetchall()
+    current = next((r for r in reports if r["superseded_by_id"] is None), None)
+    return {
+        "chain_id": chain_id,
+        "current_report_id": current["id"] if current else None,
+        "report_count": len(reports),
+        "reports": reports,
+        "supersessions": supersessions,
     }
 
 
